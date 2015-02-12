@@ -352,78 +352,100 @@ class CeresNode(object):
       elif untilTime >= slice_tmp.startTime:
         if biggest_timeStep < slice_tmp.timeStep: biggest_timeStep = slice_tmp.timeStep
 
+    resultValues = None
+    result_length = 0
+
     slices_arr = []
     for slice_tmp in self.slices:
       bogus = 0
       for item in slices_map.values():
         if (slice_tmp.startTime > item[0] and slice_tmp.endTime < item[1]) or (slice_tmp.startTime > untilTime or slice_tmp.endTime < fromTime):
           bogus = 1
-      if not bogus: slices_arr.append(slice_tmp)
+      if not bogus:
+        slices_arr.append(slice_tmp)
 
-    for slice in slices_arr:
-      # if the requested interval starts after the start of this slice
-      if fromTime >= slice.startTime:
+      for slice in slices_arr:
+        # print("slice timestep=%s start=%s end=%s" % (slice.timeStep, slice.startTime, slice.endTime))
+        # if the requested interval starts after the start of this slice
+        is_last = False
+        if fromTime >= slice.startTime:
+          requestUntilTime = untilTime
+          requestFromTime = fromTime
+          is_last = True
+        elif untilTime >= slice.startTime:
+          # Or if slice contains data for part of the requested interval...
+          # Split the request up if it straddles a slice boundary
+          if (sliceBoundary is not None) and untilTime > sliceBoundary:
+            requestUntilTime = sliceBoundary
+          else:
+            requestUntilTime = untilTime
+          requestFromTime = slice.startTime
+          sliceBoundary = slice.startTime
+        else:
+          # this is the right-side boundary on the next iteration
+          sliceBoundary = slice.startTime
+          continue
+
         try:
-          series = slice.read(fromTime, untilTime)
+          series = slice.read(requestFromTime, requestUntilTime)
           if slice.timeStep < biggest_timeStep:
             series.values = recalculateSeries(series.values, slice.timeStep, biggest_timeStep)
+            series.timeStep = biggest_timeStep
+          # print("0 slice_len=%s, calculated_len=%s" % (len(series.values), (series.endTime - series.startTime)/biggest_timeStep))
         except NoData:
           break
 
         earliestData = series.startTime
 
-        rightMissing = (untilTime - series.endTime) / biggest_timeStep
-        rightNulls = [None for i in range(rightMissing - len(resultValues))]
-        resultValues = series.values + rightNulls + resultValues
-        break
-
-      # or if slice contains data for part of the requested interval
-      elif untilTime >= slice.startTime:
-        # Split the request up if it straddles a slice boundary
-        if (sliceBoundary is not None) and untilTime > sliceBoundary:
-          requestUntilTime = sliceBoundary
-        else:
-          requestUntilTime = untilTime
-
-        try:
-          series = slice.read(slice.startTime, requestUntilTime)
-          if slice.timeStep < biggest_timeStep:
-            series.values = recalculateSeries(series.values, slice.timeStep, biggest_timeStep)
-        except NoData:
-          continue
-
-        earliestData = series.startTime
-
         rightMissing = (requestUntilTime - series.endTime) / biggest_timeStep
-        rightNulls = [None for i in range(rightMissing)]
-        resultValues = series.values + rightNulls + resultValues
 
-      # this is the right-side boundary on the next iteration
-      sliceBoundary = slice.startTime
+        if resultValues is None:
+          result_length = 0
+
+        rightNulls = TimeSeriesData(series.endTime,
+                                    series.endTime + rightMissing,
+                                    biggest_timeStep,
+                                    [None for i in range(rightMissing - result_length)])
+        series += rightNulls
+        if resultValues is None:
+          resultValues = series
+        else:
+          if resultValues.startTime > series.startTime:
+            series.merge(resultValues)
+            resultValues = series
+          else:
+            resultValues.merge(series)
+        result_length = len(resultValues)
+        if is_last:
+          break
 
     # The end of the requested interval predates all slices
     if earliestData is None:
       if biggest_timeStep is 1:
-          now = int(time.time())
-          try:
-              biggest_timeStep = metadata["timeStep"]
-              tmp = 0
-              for ts in metadata["retentions"]:
-                  tmp += ts[0] * ts[1]
-                  if untilTime > now - tmp:
-                      break
-                  biggest_timeStep = ts[0]
-          except TypeError:
-              biggest_timeStep = DEFAULT_TIMESTEP
+        now = int(time.time())
+        try:
+          biggest_timeStep = metadata["timeStep"]
+          tmp = 0
+          for ts in metadata["retentions"]:
+            tmp += ts[0] * ts[1]
+            if untilTime > now - tmp:
+              break
+            biggest_timeStep = ts[0]
+        except TypeError:
+          biggest_timeStep = DEFAULT_TIMESTEP
       missing = int(untilTime - fromTime) / biggest_timeStep
-      resultValues = [None for i in range(missing)] 
+      resultValues = TimeSeriesData(fromTime, untilTime, biggest_timeStep, [None for i in range(missing)])
 
     # Left pad nulls if the start of the requested interval predates all slices
     else:
       leftMissing = (earliestData - fromTime) / biggest_timeStep
-      leftNulls = [None for i in range(leftMissing)]
+      leftNulls = TimeSeriesData(fromTime,
+                                 fromTime + leftMissing,
+                                 biggest_timeStep,
+                                 [None for i in range(leftMissing)])
       resultValues = leftNulls + resultValues
-    return TimeSeriesData(fromTime, untilTime, biggest_timeStep, resultValues)
+    # print("vals=%s, computed_vals=%s" % (len(resultValues.values), (untilTime - fromTime)/biggest_timeStep))
+    return resultValues
 
   def write(self, datapoints):
     if self.timeStep is None:
@@ -682,22 +704,39 @@ class TimeSeriesData(object):
   def __len__(self):
     return len(self.values)
 
+  def __add__(self, other):
+    if self.timeStep != other.timeStep:
+      raise ValueError("Can't sum data with different timestamps. Mine is %s, other's is %s" %
+                         (self.timeStep, other.timeStep))
+    new_data = TimeSeriesData(self.startTime, other.endTime, self.timeStep, self.values + other.values)
+    return new_data
+
   def merge(self, other):
-    for timestamp, value in other:
-      if value is None:
-        continue
+    """
+    Merge two TimeSeriesData objects together
 
-      timestamp -= timestamp % self.timeStep
-      if timestamp < self.startTime:
-        continue
-
-      index = int((timestamp - self.startTime) / self.timeStep)
-
-      try:
-        if self.values[index] is None:
+    :param other: another TimeSeriesData object, that'll be merged. Note, other.startTime must be greater than self's.
+    :return: Nothing
+    """
+    if self.timeStep != other.timeStep:
+        raise ValueError("Can't merge data with different timestamps. Mine is %s, other's is %s" %
+                           (self.timeStep, other.timeStep))
+    # Align timestamp
+    ts = other.startTime - (other.startTime % self.timeStep)
+    index = int((ts - self.startTime) / self.timeStep)
+    for value in other.values:
+      # Adjust timestamp to be aligned on timeStep boundary.
+      if ts > self.endTime:
+        self.values.append(value)
+      else:
+        try:
           self.values[index] = value
-      except IndexError:
-        continue
+        except IndexError:
+          self.values.append(value)
+        index += 1
+      ts += self.timeStep
+    if other.endTime > self.endTime:
+      self.endTime = other.endTime
 
 
 class CorruptNode(Exception):
